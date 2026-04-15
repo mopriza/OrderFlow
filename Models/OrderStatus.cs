@@ -1,6 +1,10 @@
-namespace OrderFlow.Console.Models;
+using System;
 
 public enum OrderStatus
 {
-    New, Validated, Processing, Completed, Cancelled
+    New,
+    Validated,
+    Processing,
+    Completed,
+    Cancelled
 }
