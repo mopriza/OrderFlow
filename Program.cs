@@ -1,56 +1,70 @@
 using System;
-using System.Collections.Generic;
-using System.Diagnostics;
+using System.IO;
+using System.Linq;
 using System.Threading.Tasks;
-using OrderFlow.Console.Models;
+using OrderFlow.Console.Data;
+using OrderFlow.Console.Persistence;
 using OrderFlow.Console.Services;
+using OrderFlow.Console.Watchers;
 
 class Program
 {
     static async Task Main(string[] args)
     {
-        System.Console.WriteLine("\n 1 Zdarzenia (Events)");
-        var pipeline = new OrderPipeline();
+        var orders = SampleData.Orders;
+        var repo = new OrderRepository();
         
-        pipeline.StatusChanged += (sender, e) => System.Console.WriteLine($"[Logger] Zamówienie {e.Order.Id}: {e.OldStatus} -> {e.NewStatus}");
-        pipeline.StatusChanged += (sender, e) => { if(e.NewStatus == OrderStatus.Completed) System.Console.WriteLine($"[Email] Wysłano potwierdzenie dla zamówienia {e.Order.Id}"); };
-        pipeline.ValidationCompleted += (sender, e) => System.Console.WriteLine($"[Statystyki] Walidacja zamówienia {e.Order.Id} zakończona. Wynik: {e.IsValid}");
+        System.Console.WriteLine(" Zapis i odczyt JSON / XML ");
+        string jsonPath = "data/orders.json";
+        string xmlPath = "data/orders.xml";
 
-        pipeline.ProcessOrder(new Order { Id = 101, Status = OrderStatus.New });
-        pipeline.ProcessOrder(new Order { Id = 102, Status = OrderStatus.New });
+        await repo.SaveToJsonAsync(orders, jsonPath);
+        await repo.SaveToXmlAsync(orders, xmlPath);
+        System.Console.WriteLine("Zapisano dane do plików!");
 
-        System.Console.WriteLine("\n 2 Asynchroniczność ");
-        var simulator = new ExternalServiceSimulator();
-        var orders = new List<Order>();
-        for (int i = 1; i <= 6; i++) orders.Add(new Order { Id = 200 + i });
+        var loadedJson = await repo.LoadFromJsonAsync(jsonPath);
+        var loadedXml = await repo.LoadFromXmlAsync(xmlPath);
+        
+        System.Console.WriteLine($"Oryginał: {orders.Count} zamówień, suma: {orders.Sum(o => o.TotalAmount)}");
+        System.Console.WriteLine($"Wczytane JSON: {loadedJson.Count} zamówień, suma: {loadedJson.Sum(o => o.TotalAmount)}");
+        System.Console.WriteLine($"Wczytane XML: {loadedXml.Count} zamówień, suma: {loadedXml.Sum(o => o.TotalAmount)}\n");
 
-        System.Console.WriteLine("Sekwencyjnie:");
-        var swSeq = Stopwatch.StartNew();
-        foreach (var o in orders) await simulator.ProcessOrderAsync(o);
-        System.Console.WriteLine($"Czas sekwencyjny: {swSeq.ElapsedMilliseconds}ms\n");
 
-        System.Console.WriteLine("Równolegle (z ograniczeniem do 3):");
-        var swPar = Stopwatch.StartNew();
-        await simulator.ProcessMultipleOrdersAsync(orders);
-        System.Console.WriteLine($"Czas równoległy: {swPar.ElapsedMilliseconds}ms\n");
+        System.Console.WriteLine("LINQ to XML Raport");
+        var builder = new XmlReportBuilder();
+        string reportPath = "data/report.xml";
+        
+        var reportDoc = builder.BuildReport(orders);
+        await builder.SaveReportAsync(reportDoc, reportPath);
+        System.Console.WriteLine("Raport XML wygenerowany i zapisany.");
 
-        System.Console.WriteLine("\n 3: Thread Safety ");
-        var stats = new OrderStatistics();
-        var massOrders = new List<Order>();
-        for (int i = 0; i < 10000; i++) massOrders.Add(new Order { Id = i, Status = OrderStatus.Processing });
+        var highValueIds = await builder.FindHighValueOrderIdsAsync(reportPath, 1000m);
+        System.Console.WriteLine($"Id zamówień powyżej 1000: {string.Join(", ", highValueIds)}\n");
 
-        Parallel.ForEach(massOrders, order => 
+
+        System.Console.WriteLine("Inbox Watcher");
+        var pipeline = new OrderPipeline();
+        pipeline.StatusChanged += (s, e) => System.Console.WriteLine($"   [Pipeline] Zamówienie {e.Order.Id} zmieniło status: {e.NewStatus}");
+
+        string inboxPath = "inbox";
+        using var watcher = new InboxWatcher(inboxPath, pipeline);
+        watcher.Start();
+        System.Console.WriteLine("Watcher uruchomiony. Generowanie testowych plików JSON...");
+
+        
+        for (int i = 1; i <= 2; i++)
         {
-            try { stats.ProcessWithBug(order, false); } catch { }
-        });
+            await Task.Delay(2000); 
+            string testFilePath = Path.Combine(inboxPath, $"test_import_{i}.json");
+            
+            // saving some orders
+            var testOrders = orders.Take(2).ToList();
+            testOrders[0].Id = 900 + i; // id changing
+            await repo.SaveToJsonAsync(testOrders, testFilePath);
+        }
 
-        Parallel.ForEach(massOrders, order => 
-        {
-            stats.ProcessSafely(order, false);
-        });
-
-        System.Console.WriteLine("Oczekiwane: TotalProcessed = 10000, TotalRevenue = 1000000");
-        System.Console.WriteLine($"Z BUGIEM: Processed = {stats.BuggyTotalProcessed}, Revenue = {stats.BuggyTotalRevenue}, Błędy = {stats.BuggyProcessingErrors.Count}");
-        System.Console.WriteLine($"BEZPIECZNE: Processed = {stats.SafeTotalProcessed}, Revenue = {stats.SafeTotalRevenue}, Błędy = {stats.SafeProcessingErrors.Count}");
+        
+        await Task.Delay(3000);
+        System.Console.WriteLine("\ndone");
     }
 }
