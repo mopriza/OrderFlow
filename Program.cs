@@ -1,70 +1,127 @@
 using System;
-using System.IO;
 using System.Linq;
 using System.Threading.Tasks;
-using OrderFlow.Console.Data;
+using Microsoft.EntityFrameworkCore;
+using OrderFlow.Console.Models;
 using OrderFlow.Console.Persistence;
-using OrderFlow.Console.Services;
-using OrderFlow.Console.Watchers;
 
 class Program
 {
     static async Task Main(string[] args)
     {
-        var orders = SampleData.Orders;
-        var repo = new OrderRepository();
+        using var db = new OrderFlowContext();
+        await db.Database.MigrateAsync();
+        await DatabaseSeeder.SeedAsync(db);
+
+        System.Console.WriteLine("\n zadanie 2: CRUD ");
         
-        System.Console.WriteLine(" Zapis i odczyt JSON / XML ");
-        string jsonPath = "data/orders.json";
-        string xmlPath = "data/orders.xml";
+        // CREATE
+        var newOrder = new Order { CustomerId = 1, Notes = "Pilne!", Status = OrderStatus.New };
+        newOrder.Items.Add(new OrderItem { ProductId = 2, Quantity = 2 }); 
+        newOrder.Items.Add(new OrderItem { ProductId = 5, Quantity = 1 }); 
+        db.Orders.Add(newOrder);
+        await db.SaveChangesAsync();
+        System.Console.WriteLine($"[CREATE] Dodano zamówienie #{newOrder.Id} z 2 pozycjami.");
 
-        await repo.SaveToJsonAsync(orders, jsonPath);
-        await repo.SaveToXmlAsync(orders, xmlPath);
-        System.Console.WriteLine("Zapisano dane do plików!");
+        // READ
+        var readOrder = await db.Orders
+            .Include(o => o.Customer)
+            .Include(o => o.Items).ThenInclude(i => i.Product)
+            .FirstOrDefaultAsync(o => o.Id == newOrder.Id);
+        System.Console.WriteLine($"[READ] Wczytano zamówienie: Klient: {readOrder.Customer.Name}, Kwota: {readOrder.TotalAmount}");
 
-        var loadedJson = await repo.LoadFromJsonAsync(jsonPath);
-        var loadedXml = await repo.LoadFromXmlAsync(xmlPath);
-        
-        System.Console.WriteLine($"Oryginał: {orders.Count} zamówień, suma: {orders.Sum(o => o.TotalAmount)}");
-        System.Console.WriteLine($"Wczytane JSON: {loadedJson.Count} zamówień, suma: {loadedJson.Sum(o => o.TotalAmount)}");
-        System.Console.WriteLine($"Wczytane XML: {loadedXml.Count} zamówień, suma: {loadedXml.Sum(o => o.TotalAmount)}\n");
+        // UPDATE
+        readOrder.Status = OrderStatus.Processing;
+        readOrder.Notes = "Już nie takie pilne";
+        await db.SaveChangesAsync();
+        System.Console.WriteLine($"[UPDATE] Zaktualizowano status na: {readOrder.Status}");
 
-
-        System.Console.WriteLine("LINQ to XML Raport");
-        var builder = new XmlReportBuilder();
-        string reportPath = "data/report.xml";
-        
-        var reportDoc = builder.BuildReport(orders);
-        await builder.SaveReportAsync(reportDoc, reportPath);
-        System.Console.WriteLine("Raport XML wygenerowany i zapisany.");
-
-        var highValueIds = await builder.FindHighValueOrderIdsAsync(reportPath, 1000m);
-        System.Console.WriteLine($"Id zamówień powyżej 1000: {string.Join(", ", highValueIds)}\n");
-
-
-        System.Console.WriteLine("Inbox Watcher");
-        var pipeline = new OrderPipeline();
-        pipeline.StatusChanged += (s, e) => System.Console.WriteLine($"   [Pipeline] Zamówienie {e.Order.Id} zmieniło status: {e.NewStatus}");
-
-        string inboxPath = "inbox";
-        using var watcher = new InboxWatcher(inboxPath, pipeline);
-        watcher.Start();
-        System.Console.WriteLine("Watcher uruchomiony. Generowanie testowych plików JSON...");
-
-        
-        for (int i = 1; i <= 2; i++)
+        // DELETE
+        var orderToDelete = await db.Orders.FirstOrDefaultAsync(o => o.Status == OrderStatus.Cancelled);
+        if (orderToDelete != null)
         {
-            await Task.Delay(2000); 
-            string testFilePath = Path.Combine(inboxPath, $"test_import_{i}.json");
-            
-            // saving some orders
-            var testOrders = orders.Take(2).ToList();
-            testOrders[0].Id = 900 + i; // id changing
-            await repo.SaveToJsonAsync(testOrders, testFilePath);
+            db.Orders.Remove(orderToDelete);
+            await db.SaveChangesAsync();
+            System.Console.WriteLine($"[DELETE] Usunięto anulowane zamówienie #{orderToDelete.Id}");
         }
 
+
+        System.Console.WriteLine("\n zadanie 3: ZAPYTANIA LINQ ");
         
-        await Task.Delay(3000);
-        System.Console.WriteLine("\ndone");
+        // 1. Zamówienia VIP > progu (Używamy rzutowania na double dla SQLite!)
+        var vipOrders = await db.Orders.Include(o => o.Customer).Include(o => o.Items).ThenInclude(i => i.Product)
+            .Where(o => o.Customer.IsVip && o.Items.Sum(i => (double)(i.Quantity * i.Product.Price)) > 1000).ToListAsync();
+        System.Console.WriteLine($"1. Zamówienia VIP > 1000 PLN: Znaleziono {vipOrders.Count}");
+
+        // 2. Ranking klientów
+        var ranking = await db.Orders.Include(o => o.Customer).Include(o => o.Items).ThenInclude(i => i.Product)
+            .GroupBy(o => o.Customer.Name)
+            .Select(g => new { Name = g.Key, Total = g.Sum(o => o.Items.Sum(i => (double)(i.Quantity * i.Product.Price))) })
+            .OrderByDescending(x => x.Total).ToListAsync();
+        System.Console.WriteLine($"2. Najlepszy klient: {ranking.First().Name} ({ranking.First().Total} PLN)");
+
+        // 3. Średnia wartość per miasto
+        var avgPerCity = await db.Orders.Include(o => o.Customer).Include(o => o.Items).ThenInclude(i => i.Product)
+            .GroupBy(o => o.Customer.City)
+            .Select(g => new { City = g.Key, Avg = g.Average(o => o.Items.Sum(i => (double)(i.Quantity * i.Product.Price))) }).ToListAsync();
+        System.Console.WriteLine($"3. Średnia dla Warszawy: {avgPerCity.FirstOrDefault(x => x.City == "Warszawa")?.Avg:F2} PLN");
+
+        // 4. Produkty nigdy nie zamówione (Anti-join)
+        var unusedProducts = await db.Products.Where(p => !p.OrderItems.Any()).ToListAsync();
+        System.Console.WriteLine($"4. Nigdy nie zamówione produkty: {string.Join(", ", unusedProducts.Select(p => p.Name))}");
+
+        // 5. Dynamiczne zapytanie
+        OrderStatus? filterStatus = OrderStatus.Processing;
+        decimal minAmount = 500m;
+        IQueryable<Order> query = db.Orders.Include(o => o.Items).ThenInclude(i => i.Product);
+        if (filterStatus.HasValue) query = query.Where(o => o.Status == filterStatus.Value);
+        var dynamicResult = await query.ToListAsync();
+        var finalFiltered = dynamicResult.Where(o => o.TotalAmount > minAmount).ToList();
+        System.Console.WriteLine($"5. Dynamiczne (Processing, >500 PLN): {finalFiltered.Count} zamówień");
+
+
+        System.Console.WriteLine("\n zadanie 3: TRANSAKCJE ");
+        
+        // Sukces (zamówienie 102 - ma dużo towaru)
+        await ProcessOrderTransactionAsync(db, 2); 
+        
+        // Błąd (zamówienie 101 - ma laptopa, a daliśmy mu Stock = 1, zróbmy próbę kupienia 2 sztuk ręcznie)
+        var failOrder = new Order { CustomerId = 1, Status = OrderStatus.New };
+        failOrder.Items.Add(new OrderItem { ProductId = 1, Quantity = 5 }); // Chcemy 5 laptopów (jest 1)
+        db.Orders.Add(failOrder);
+        await db.SaveChangesAsync();
+        
+        await ProcessOrderTransactionAsync(db, failOrder.Id);
+    }
+
+    static async Task ProcessOrderTransactionAsync(OrderFlowContext db, int orderId)
+    {
+        using var transaction = await db.Database.BeginTransactionAsync();
+        try
+        {
+            var order = await db.Orders.Include(o => o.Items).ThenInclude(i => i.Product).FirstOrDefaultAsync(o => o.Id == orderId);
+            if (order == null) return;
+
+            order.Status = OrderStatus.Processing;
+
+            foreach (var item in order.Items)
+            {
+                if (item.Product.Stock < item.Quantity)
+                {
+                    throw new Exception($"Brak towaru na magazynie: {item.Product.Name}");
+                }
+                item.Product.Stock -= item.Quantity;
+            }
+
+            order.Status = OrderStatus.Completed;
+            await db.SaveChangesAsync();
+            await transaction.CommitAsync();
+            System.Console.WriteLine($"[Transakcja] SUKCES: Zamówienie #{orderId} zrealizowane.");
+        }
+        catch (Exception ex)
+        {
+            await transaction.RollbackAsync();
+            System.Console.WriteLine($"[Transakcja] ROLLBACK: Zamówienie #{orderId} anulowane. Błąd: {ex.Message}");
+        }
     }
 }
